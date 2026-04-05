@@ -18,9 +18,10 @@ PHOTO_EXTS = [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]
 
 
 def _build_photo_map(photo_dir):
+    """Returns (dict: number→path, list: paths sorted by number)."""
     mapping = {}
     if not photo_dir or not os.path.isdir(photo_dir):
-        return mapping
+        return mapping, []
     for fname in sorted(os.listdir(photo_dir)):
         if not any(fname.lower().endswith(e) for e in (".jpg", ".jpeg", ".png")):
             continue
@@ -29,14 +30,19 @@ def _build_photo_map(photo_dir):
             n = int(m.group(1))
             if n not in mapping:
                 mapping[n] = os.path.join(photo_dir, fname)
-    return mapping
+    sorted_list = [mapping[k] for k in sorted(mapping)]
+    return mapping, sorted_list
 
 
-def _find_photo(photo_dir, index_1based, name, photo_map):
+def _find_photo(photo_dir, index_1based, name, photo_map, photo_list):
+    # 1. direct key match  (photo number == student index/STT)
     if index_1based in photo_map:
         return photo_map[index_1based]
-    for stem in [str(index_1based), name,
-                 re.sub(r"\s+", "", name), re.sub(r"\s+", "_", name)]:
+    # 2. positional fallback — nth student gets nth photo in sorted order
+    if 1 <= index_1based <= len(photo_list):
+        return photo_list[index_1based - 1]
+    # 3. name-based fallback
+    for stem in [name, re.sub(r"\s+", "", name), re.sub(r"\s+", "_", name)]:
         for ext in PHOTO_EXTS:
             p = os.path.join(photo_dir, stem + ext)
             if os.path.isfile(p):
@@ -62,23 +68,55 @@ def _make_font(font_file, size):
 #  Core processing
 # ─────────────────────────────────────────────
 
+def _cell_text(value):
+    """Convert an Excel cell value to display string.
+    Dates → DD/MM/YYYY, everything else → str."""
+    if value is None:
+        return ""
+    try:
+        # openpyxl returns datetime / date objects for date cells
+        import datetime as _dt
+        if isinstance(value, (_dt.datetime, _dt.date)):
+            return value.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _read_stt(stt_col, row, cell_fn, fallback_index):
+    if stt_col > 0:
+        val = cell_fn(row, stt_col - 1)
+        try:
+            return int(float(val))   # handles "30", "30.0", 30, 30.0
+        except (ValueError, TypeError):
+            pass
+    return fallback_index + 1
+
+
 def process_images(cfg, log, progress_cb, done_cb):
     try:
         wb = openpyxl.load_workbook(cfg["excel_file"], read_only=True, data_only=True)
         ws = wb["Sheet1"]
 
+        name_col = max(0, cfg.get("name_col", 1) - 1)   # 1-based → 0-based
+        stt_col  = cfg.get("stt_col", 0)                # 0 = auto index
+
+        def _cell(row, i):
+            return str(row[i]) if i < len(row) and row[i] is not None else ""
+
         arr = []
         for index, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
             if 0 <= index < 48:
                 obj = {
-                    "name":      re.sub(r" +", " ", str(row[0]) if row[0] else ""),
-                    "imageName": re.sub(r" *", "", str(row[1])
+                    "name":      re.sub(r" +", " ", _cell(row, name_col)).strip(),
+                    "imageName": re.sub(r" *", "", _cell(row, 1)
                                         .replace("x2", "").replace(" .", "")
                                         .replace("(", "").replace(")", "").replace("X2 ", "")),
-                    "index":     index + 1,
+                    "index":     _read_stt(stt_col, row, _cell, index),
                     "row":       row,
                 }
-                arr.append(obj)
+                if obj["name"] or obj["imageName"]:
+                    arr.append(obj)
 
         os.makedirs(cfg["output_folder"], exist_ok=True)
         im1 = Image.open(cfg["base_image"]).convert("RGB")
@@ -87,13 +125,13 @@ def process_images(cfg, log, progress_cb, done_cb):
         use_photo = (cfg.get("use_photo") and cfg.get("photo_dir")
                      and os.path.isdir(cfg["photo_dir"])
                      and cfg.get("photo_w", 0) > 0 and cfg.get("photo_h", 0) > 0)
-        photo_map = _build_photo_map(cfg.get("photo_dir", "")) if use_photo else {}
+        photo_map, photo_list = _build_photo_map(cfg.get("photo_dir", "")) if use_photo else ({}, [])
 
         for i, e in enumerate(arr):
             back_im = im1.copy()
 
             if use_photo:
-                path = _find_photo(cfg["photo_dir"], e["index"], e["name"], photo_map)
+                path = _find_photo(cfg["photo_dir"], e["index"], e["name"], photo_map, photo_list)
                 if path:
                     _paste_photo(back_im, path,
                                  cfg["photo_x"], cfg["photo_y"],
@@ -119,7 +157,7 @@ def process_images(cfg, log, progress_cb, done_cb):
                 row_data = e["row"]
                 if col_idx < 0 or col_idx >= len(row_data) or row_data[col_idx] is None:
                     continue
-                text = str(row_data[col_idx]).strip()
+                text = _cell_text(row_data[col_idx])
                 if text:
                     draw.text((field["x"], field["y"]), text, cfg["text_color"],
                               font=_make_font(cfg.get("font_file"), field["size"]))
@@ -146,7 +184,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Tạo Ảnh Hàng Loạt")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self._preview_job = None
         self._tk_img = None
         # drag state
@@ -190,10 +228,24 @@ class App(tk.Tk):
 
     # ── build ─────────────────────────────────
     def _build_ui(self):
+        # ── Scrollable container ───────────────
+        _canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        _vsb = ttk.Scrollbar(self, orient="vertical", command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side="right", fill="y")
+        _canvas.pack(side="left", fill="both", expand=True)
+        p = ttk.Frame(_canvas)
+        _canvas.create_window((0, 0), window=p, anchor="nw")
+        p.bind("<Configure>", lambda e: _canvas.configure(
+            scrollregion=_canvas.bbox("all"),
+            width=e.width))
+        _canvas.bind_all("<MouseWheel>",
+                         lambda e: _canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
         pad = {"padx": 10, "pady": 6}
 
         # ── Files ─────────────────────────────
-        f_files = ttk.LabelFrame(self, text="Tệp tin", padding=8)
+        f_files = ttk.LabelFrame(p, text="Tệp tin", padding=8)
         f_files.grid(row=0, column=0, columnspan=2, sticky="ew", **pad)
 
         self.v_excel    = tk.StringVar()
@@ -226,7 +278,7 @@ class App(tk.Tk):
                    ).grid(row=4, column=2, padx=4, pady=2)
 
         # ── Left column ────────────────────────
-        left = ttk.Frame(self)
+        left = ttk.Frame(p)
         left.grid(row=1, column=0, sticky="nsew", **pad)
 
         # ── Text position ──────────────────────
@@ -240,27 +292,41 @@ class App(tk.Tk):
         self.v_size_chu     = tk.IntVar(value=75)
         self.v_size_chu_dai = tk.IntVar(value=70)
         self.v_tong_chu_dai = tk.IntVar(value=19)
+        self.v_name_col     = tk.IntVar(value=1)
 
-        for i, (lbl, var) in enumerate([
-            ("Lề trái (thường):",  self.v_chu_trai),
-            ("Lề trên (thường):",  self.v_chu_tren),
-            ("Lề trái (tên dài):", self.v_chu_trai_dai),
-            ("Lề trên (tên dài):", self.v_chu_tren_dai),
-            ("Cỡ chữ (thường):",   self.v_size_chu),
-            ("Cỡ chữ (tên dài):",  self.v_size_chu_dai),
-            ("Ngưỡng tên dài:",    self.v_tong_chu_dai),
-        ]):
+        # compact 3-col layout: label | thường | tên dài
+        tk.Label(f_pos, text="Thường", font=("", 9, "bold")).grid(row=0, column=1, padx=4)
+        tk.Label(f_pos, text="Tên dài", font=("", 9, "bold")).grid(row=0, column=2, padx=4)
+
+        for i, (lbl, v1, v2) in enumerate([
+            ("Lề trái:", self.v_chu_trai,  self.v_chu_trai_dai),
+            ("Lề trên:", self.v_chu_tren,  self.v_chu_tren_dai),
+            ("Cỡ chữ:",  self.v_size_chu,  self.v_size_chu_dai),
+        ], start=1):
             self._lbl(f_pos, lbl, i, 0)
-            self._spin(f_pos, var, i, 1)
+            self._spin(f_pos, v1, i, 1)
+            self._spin(f_pos, v2, i, 2)
+
+        self._lbl(f_pos, "Ngưỡng tên dài:", 4, 0)
+        self._spin(f_pos, self.v_tong_chu_dai, 4, 1)
+
+        self.v_stt_col = tk.IntVar(value=0)   # 0 = dùng số thứ tự tự động
+        self._lbl(f_pos, "Cột tên (Excel):", 5, 0)
+        self._spin(f_pos, self.v_name_col, 5, 1, from_=1)
+        self._lbl(f_pos, "Cột STT (Excel):", 6, 0)
+        self._spin(f_pos, self.v_stt_col, 6, 1, from_=0)
+        tk.Label(f_pos, text="(0 = tự động)", fg="gray", font=("", 8)
+                 ).grid(row=6, column=2, sticky="w", padx=2)
 
         self.v_text_color = tk.StringVar(value="#000000")
         self._lbl(f_pos, "Màu chữ:", 7, 0)
         cr = ttk.Frame(f_pos)
-        cr.grid(row=7, column=1, sticky="w", padx=4, pady=2)
+        cr.grid(row=7, column=1, columnspan=2, sticky="w", padx=4, pady=2)
         self.color_preview = tk.Label(cr, bg="#000000", width=4, relief="solid")
         self.color_preview.pack(side="left")
         ttk.Button(cr, text="Chọn màu…", command=self._pick_color).pack(side="left", padx=6)
         self.v_text_color.trace_add("write", lambda *_: self._schedule_preview())
+        self._trace(self.v_name_col)
 
         # ── Photo settings ─────────────────────
         f_photo = ttk.LabelFrame(left, text="Ảnh Học Sinh", padding=8)
@@ -295,7 +361,7 @@ class App(tk.Tk):
                    ).grid(row=5, column=2, padx=4, pady=2)
 
         # ── Preview ────────────────────────────
-        f_prev = ttk.LabelFrame(self, text="Xem Trước  (kéo thả để đổi vị trí)", padding=8)
+        f_prev = ttk.LabelFrame(p, text="Xem Trước  (kéo thả để đổi vị trí)", padding=8)
         f_prev.grid(row=1, column=1, sticky="nsew", **pad)
 
         self.v_preview_name = tk.StringVar(value="Nguyen Van A")
@@ -316,7 +382,7 @@ class App(tk.Tk):
         self.preview_canvas.bind("<ButtonRelease-1>", self._drag_end)
 
         # ── Extra fields ───────────────────────
-        f_extra = ttk.LabelFrame(self, text="Thông Tin Bổ Sung", padding=8)
+        f_extra = ttk.LabelFrame(p, text="Thông Tin Bổ Sung", padding=8)
         f_extra.grid(row=2, column=0, columnspan=2, sticky="ew", **pad)
 
         for col, txt in enumerate(["", "Trường", "Cột Excel", "X", "Y", "Cỡ chữ", "Mẫu (preview)"]):
@@ -354,7 +420,7 @@ class App(tk.Tk):
             self._trace(ef["col"], ef["x"], ef["y"], ef["size"], ef["sample"])
 
         # ── Run / progress ─────────────────────
-        f_run = ttk.Frame(self, padding=8)
+        f_run = ttk.Frame(p, padding=8)
         f_run.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
         self.btn_run = ttk.Button(f_run, text="▶  Tạo Ảnh", command=self._run)
         self.btn_run.pack(side="left", padx=4)
@@ -364,7 +430,7 @@ class App(tk.Tk):
         self.lbl_status.pack(side="left")
 
         # ── Log ───────────────────────────────
-        f_log = ttk.LabelFrame(self, text="Nhật ký", padding=6)
+        f_log = ttk.LabelFrame(p, text="Nhật ký", padding=6)
         f_log.grid(row=4, column=0, columnspan=2, sticky="ew", **pad)
         self.log_box = tk.Text(f_log, height=7, width=80, state="disabled",
                                bg="#1e1e1e", fg="#d4d4d4", font=("Courier", 10))
@@ -569,6 +635,8 @@ class App(tk.Tk):
             "base_image":    self.v_base.get(),
             "font_file":     self.v_font.get(),
             "output_folder": self.v_outdir.get(),
+            "name_col":      self.v_name_col.get(),
+            "stt_col":       self.v_stt_col.get(),
             "chu_trai":      self.v_chu_trai.get(),
             "chu_tren":      self.v_chu_tren.get(),
             "chu_trai_dai":  self.v_chu_trai_dai.get(),
